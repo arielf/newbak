@@ -1,0 +1,73 @@
+---
+# yamllint disable rule:line-length
+#
+#---------------------------------------------------------------------------
+# Config file for newbak utility
+#
+# Supports mutiple encrypted incremental backup-configs using friendly names
+# with idempotent/safe underlying action behaviour.
+#---------------------------------------------------------------------------
+
+#---------------------------------------------------------------------------
+# Global commands configuration:
+#   Underlying commands (with additonal required parameters)
+#   Uses interpolated ${...} variable templates.
+#
+# They are defined further down inside each backups subsection or are auto-discovered by the
+# script when possible. ${...} variable are substituted before calling any <whatever>_command.
+#
+# The following template variables are auto-populated by the newbak utility
+#   ${rotation}     set by default to 'hourly'
+#   '${device}'     auto-discovered (see script)
+#
+# These are conveniently self-defined:
+#   ${friendlyname}     our preferred backup key
+#   ${luks_mapname}     /dev/mapper/${luks_mapname} symlink,
+#                       Pretty arbitrary. Can be the same as ${friendlyname} for convenience/simplicity
+#---------------------------------------------------------------------------
+
+#
+# -- encryption-support (lock & unlock the volume)
+#
+open_command: ['cryptsetup', 'open', '${device}', '${friendlyname}']
+
+close_command: ['cryptsetup', 'close', '${luks_mapname}']
+
+mount_command: ['mount', '-O', 'noauto,noexec,relatime', '/dev/mapper/${luks_mapname}', '${mountpoint}']
+
+# Using lazy unmounts to reduce chances of race-conditions, stuck processes, dirty filesystems
+umount_command: ['umount', '-l', '${mountpoint}']
+
+# 'rsnapshot' must be passed a rsnapshotconf configuration file after the '-c'
+# Also requires mandatory ${rotation} (hourly, daily, weekly, monthly) arg
+rsnapshot_command: ['rsnapshot', '-D', '-c', '${rsnapshotconf}', '${rotation}']
+
+#---------------------------------------------------------------------------
+# backup volume configuration
+#---------------------------------------------------------------------------
+backups:
+  #
+  # -- You may override globals inside each ${name} key (which is <friendlyname>) below!
+  #
+
+  # -- Internal 2.5" Samsung evo860 SSD
+  'pam':
+    # UUID is the outer UUID (e.g. of /dev/sda1) - not the inner (decrypted LUKS) UUID.
+    uuid: '41255543-63a6-4320-aa14-738fb849187f'
+    mountpoint: /media/pam
+    rsnapshotconf: rsnapshot-pam.conf
+    luks_mapname: 'pam'
+
+  # -- External 2.5" Sabrent enclosure with Samsung evo850
+  'doggo':
+    uuid: '97912a84-f5d0-43d6-9b6a-626f43c77643'
+    mountpoint: /media/doggo
+    rsnapshotconf: 'rsnapshot-doggo.conf'
+    luks_mapname: 'doggo'
+
+  # -- SanDisk Memory Stick
+  'sandisk64':
+    uuid: '1a78bd05-934b-4ad2-af63-d32f32cd828f'
+    mountpoint: /media/sd64
+    rsnapshotconf: 'rsnapshot-snd64.conf'
+    luks_mapname: 'sd64'
