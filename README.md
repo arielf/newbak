@@ -52,6 +52,21 @@ plus another \<N\> config-files, (one for each specific volume backup):
 
 See `man rsnapshot` for `rsnapshot` configuration details.  An example is provided here.
 
+## Example crontab
+
+Assuming devices are physically connected you may schedule your backups via cron.
+Here's an example:
+```
+# -- 'hourly' backup: every 6 hours at xx:04
+4 */6 * * * sudo newbak pam hourly
+# -- 'daily' backup: @ 4:53 am
+53 4 * * *  sudo newbak pam daily
+# -- 'weekly' backup: Every Friday @ 3:32 am
+32 3 * * 6  sudo newbak pam weekly
+# -- 'monthly' backup: 1st of the month @ 2:21 am
+21 2 1 * *  sudo newbak pam monthly
+```
+
 ## Requirements (and tested with)
 
   - A modern Linux system
