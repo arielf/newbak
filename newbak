@@ -1,0 +1,771 @@
+#!/usr/bin/env python3
+# vim: textwidth=120
+"""
+newbak - Incremental Backup Automation Tool
+
+Automates incremental backups of a local Linux system onto connected LUKS-encrypted disks
+using rsnapshot. Also provides explicit open/close commands.
+"""
+import sys
+import yaml
+import subprocess
+import os
+import datetime
+import json
+import re
+import getpass
+from pathlib import Path
+
+# --- Constants and Configuration ---
+LOG_FILE = 'newbak.log'
+DEFAULT_ROTATION = 'hourly'
+ALLOWED_PERIODS = ['hourly', 'daily', 'weekly', 'monthly']
+MAIN_COMMANDS = ['backup', 'close', 'open', 'force-open', 'help']
+UUID_REGEX = re.compile(r'^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$', re.IGNORECASE)
+CONFIG_PATHS = [
+    Path('.'),
+    Path('~/.config/newbak').expanduser()
+]
+CONFIG_FILE_NAME = 'newbak-conf.yaml'
+
+
+def log_operation(message, type='INFO'):
+    """Logs a message with a strict timestamp format to the LOG_FILE."""
+    timestamp = datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+
+    # Determine the prefix based on the type for the required log format
+    if type == 'START':
+        prefix = ' ,----- '
+    elif type == 'END':
+        prefix = ' `----- '
+    elif type in ('INFO', 'WARNING', 'ERROR'):
+        prefix = ' | '
+    else: # DEVICE, etc.
+        prefix = ' | '
+
+    log_entry = f"{timestamp}{prefix}{message}\n"
+    print(log_entry, end='') # Print to console for immediate feedback
+
+    try:
+        with open(LOG_FILE, 'a') as f:
+            f.write(log_entry)
+    except Exception as e:
+        # Cannot log to file, print error to stderr
+        print(f"{timestamp} | ERROR: Failed to write to log file {LOG_FILE}: {e}", file=sys.stderr)
+
+
+def abort(message, command_line=None):
+    """Logs an error message and exits the script."""
+    log_operation(f"ERROR: {message}", 'ERROR')
+    if command_line:
+        log_operation(command_line + ' ended', 'END')
+    sys.exit(1)
+
+
+def parse_args(args):
+    """
+    Handles argument parsing for command (backup/open/close) and target.
+    The 'backup' command is assumed if the first argument is not a known command.
+    Returns: (command, target_id, rotation)
+    """
+    if not args:
+        return 'help', None, None
+
+    first_arg = args[0].lower()
+
+    if first_arg in MAIN_COMMANDS:
+        command = first_arg
+        target_args = args[1:]
+    else:
+        # If the first argument is not a command, assume default 'backup' command
+        # and treat all arguments as potential target/rotation arguments.
+        command = 'backup'
+        target_args = args
+
+    if command == 'help':
+        return 'help', None, None
+
+    if not target_args:
+        abort(f"Command '{command}' requires a target (friendlyname or UUID).")
+
+    target_id = None
+    rotation = DEFAULT_ROTATION
+
+    for arg in target_args:
+        if arg.lower() in ALLOWED_PERIODS and command == 'backup':
+            rotation = arg.lower()
+        elif UUID_REGEX.match(arg):
+            target_id = arg
+        elif arg not in ALLOWED_PERIODS: # Assume it's the friendly name
+            target_id = arg
+
+    # Final check for target ID availability
+    if not target_id:
+        # This occurs if only a rotation period was provided without a target (e.g., 'newbak monthly')
+        abort(f"Could not identify a valid target (friendlyname or UUID) for command '{command}'.")
+
+    return command, target_id, rotation
+
+
+def print_usage(config):
+    """Prints the command usage guide."""
+    print("Usage: ./newbak [backup] <friendlyname|UUID> [rotation]")
+    print("       ./newbak <command> <friendlyname|UUID>")
+    print("\nCommands:")
+    print("  backup <target> [rotation]  Performs full open, mount, rsnapshot, unmount, and close (default command).")
+    print("  open <target>               Only performs the LUKS open operation.")
+    print("  force-open <target>         Closes any active system-created map on the device, then opens it with the configured friendly-name.")
+    print("  close <target>              Auto-unmounts the target if mounted, then performs the LUKS close operation.")
+    print("  help                        Shows this usage guide.")
+    print("\nAvailable Targets:")
+    for name, info in config.get('backups', {}).items():
+        print(f"  {name:<15} (UUID: {info.get('uuid', 'N/A')}, Mount: {info.get('mountpoint', 'N/A')})")
+    print(f"\nDefault rotation: {DEFAULT_ROTATION}. Allowed periods: {', '.join(ALLOWED_PERIODS)}")
+    sys.exit(0)
+
+
+def find_config_file():
+    """Searches for newbak-conf.yaml in the specified paths."""
+    for path in CONFIG_PATHS:
+        config_path = path / CONFIG_FILE_NAME
+        if config_path.is_file():
+            log_operation(f"Loaded configuration from: {config_path}", 'INFO')
+            return config_path
+    return None
+
+
+def load_config(config_path):
+    """Loads and validates the backup configuration from the YAML file."""
+    try:
+        with open(config_path, 'r') as f:
+            config = yaml.safe_load(f)
+
+        if 'backups' not in config:
+            raise ValueError("'backups' key missing from configuration.")
+
+        return config
+
+    except yaml.YAMLError as e:
+        abort(f"Error parsing YAML configuration: {e}")
+    except ValueError as e:
+        abort(f"Configuration validation error: {e}")
+
+
+def substitute_template(command_list, context):
+    """
+    Substitutes ${variables} wherever they appear in command list elements.
+    Supports partial substitution within strings (e.g., '/path/${variable}/file').
+    """
+    if not isinstance(command_list, list):
+        return command_list
+
+    substituted_list = []
+
+    for item in command_list:
+        if not isinstance(item, str):
+            # If it's not a string (e.g., number, or boolean), append as is
+            substituted_list.append(item)
+            continue
+
+        # Perform replacement for all variables defined in context
+        new_item = item
+        for var_name, var_value in context.items():
+            placeholder = f'${{{var_name}}}'
+            # Convert value to string before replacement
+            new_item = new_item.replace(placeholder, str(var_value))
+
+        substituted_list.append(new_item)
+
+    return substituted_list
+
+
+def run_command(command_list, check=True, log_output=False, capture_output=False, input_data=None):
+    """
+    Executes a shell command using subprocess.
+    If input_data is provided, it is piped to the command's stdin.
+    Returns the subprocess.CompletedProcess result object.
+    """
+    if command_list is None:
+        raise TypeError("Configuration Error: A required command list is missing from newbak-conf.yaml.")
+
+    if command_list and len(command_list) > 0:
+        if command_list[0] == 'mount' and len(command_list) < 3:
+            raise ValueError(f"Configuration Error: Incomplete 'mount_command' detected: '{' '.join(command_list)}'. Must include source and target.")
+        if command_list[0] == 'umount' and len(command_list) < 2:
+            raise ValueError(f"Configuration Error: Incomplete 'umount_command' detected: '{' '.join(command_list)}'. Must include mountpoint.")
+
+
+    # Log the command string *after* substitution
+    cmd_str = ' '.join(command_list)
+    log_operation(f"Executing: {cmd_str}")
+
+    try:
+        # NOTE: We do NOT explicitly set 'stdin' here. If 'input_data' is provided,
+        # subprocess.run automatically configures stdin for piping the data, and setting
+        # it manually conflicts with the 'input' argument, causing an error.
+        result = subprocess.run(
+            command_list,
+            check=check,
+            capture_output=True, # Always capture
+            text=True,
+            shell=False,
+            input=input_data # This is where the passphrase (or other input) is piped
+        )
+
+        # Log STDOUT only if explicitly requested (e.g., for detailed rsnapshot output)
+        if log_output and result.stdout:
+            for line in result.stdout.strip().split('\n'):
+                if line:
+                    log_operation(line, type='DEVICE')
+
+        # Log STDERR if the return code is non-zero
+        if result.stderr and result.returncode != 0:
+            log_operation(f"Captured STDERR (Exit Code {result.returncode}):", 'ERROR')
+            for line in result.stderr.strip().split('\n'):
+                 if line:
+                    log_operation(line, type='ERROR')
+
+        # We return the result object
+        return result
+
+    except subprocess.CalledProcessError as e:
+        log_operation(f"Command failed (Exit Code {e.returncode}): {cmd_str}", 'ERROR')
+        raise
+    except FileNotFoundError:
+        abort(f"Error: Command '{command_list[0]}' not found. Is it installed?",
+              command_line='newbak ' + ' '.join(sys.argv[1:]))
+
+
+def get_device_info(target_id, full_config):
+    """
+    Identifies the target configuration and uses lsblk to find the physical device path.
+    """
+    config = full_config['backups']
+
+    friendly_name = None
+    if target_id in config:
+        info = config[target_id].copy()
+        friendly_name = target_id
+    elif UUID_REGEX.match(target_id):
+        info = next((v.copy() for k, v in config.items() if v.get('uuid') == target_id), None)
+        friendly_name = next((k for k, v in config.items() if v.get('uuid') == target_id), None)
+        if not info:
+            abort(f"UUID '{target_id}' not found in '{CONFIG_FILE_NAME}'.")
+    else:
+        abort(f"Invalid friendly-name or UUID provided: '{target_id}'")
+
+    context = full_config.copy()
+    context.update(info)
+    context['friendlyname'] = friendly_name
+
+    for key in ['uuid', 'mountpoint', 'rsnapshotconf', 'luks_mapname']:
+        if key not in context:
+            abort(f"Configuration for '{friendly_name}' missing essential key: '{key}'")
+
+    cmd = ['lsblk', '-J', '-o', 'NAME,UUID,TYPE']
+    try:
+        result = run_command(cmd, check=True, capture_output=True)
+        lsblk_data = json.loads(result.stdout)
+    except Exception as e:
+        abort(f"Failed to run lsblk or parse output: {e}")
+
+    device_path = None
+    target_uuid = context['uuid']
+
+    def find_device(nodes):
+        for node in nodes:
+            node_uuid = node.get('uuid')
+            if node_uuid is not None and str(node_uuid).lower() == target_uuid.lower() and node.get('type') == 'part':
+                return f"/dev/{node['name']}"
+            if 'children' in node:
+                path = find_device(node['children'])
+                if path:
+                    return path
+        return None
+
+    device_path = find_device(lsblk_data.get('blockdevices', []))
+
+    if not device_path:
+        abort(f"No physical device path found for UUID {target_uuid} using lsblk. Please ensure the device is connected.")
+
+    context['device'] = device_path
+
+    return context
+
+
+def find_active_mapname(device_path):
+    """
+    Finds the active device mapper name associated with the given physical LUKS device path.
+    This map name might be system-generated (e.g., luks-...).
+    Returns: The map_name string (e.g., 'luks-uuid') or None.
+    """
+    log_operation(f"Checking for system-active LUKS map on {device_path}.", 'INFO')
+    cmd = ['lsblk', '-J', '-o', 'NAME,KNAME,PKNAME,TYPE']
+
+    try:
+        # Use subprocess.run directly as we don't want run_command to log the lsblk output
+        result = subprocess.run(cmd, check=True, capture_output=True, text=True)
+        lsblk_data = json.loads(result.stdout)
+    except Exception as e:
+        log_operation(f"Failed to run lsblk for map discovery: {e}", 'WARNING')
+        return None
+
+    target_kname = Path(device_path).name
+
+    def search_children(nodes):
+        for node in nodes:
+            # Look for the target partition
+            if node.get('kname') == target_kname and node.get('type') == 'part':
+                # Check for an active child (the mapped device)
+                if 'children' in node:
+                    for child in node['children']:
+                        # The mapped device is usually type 'crypt' or 'dm'
+                        if child.get('type') in ['crypt', 'dm'] and child.get('pkname') == target_kname:
+                            # The NAME is the friendly map name (e.g., luks-uuid or friendlyname)
+                            return child.get('name')
+                return None
+
+            # Recurse through blockdevices
+            if 'children' in node:
+                map_name = search_children(node['children'])
+                if map_name:
+                    return map_name
+        return None
+
+    return search_children(lsblk_data.get('blockdevices', []))
+
+
+def check_luks_status(luks_map_name):
+    """
+    Checks if the LUKS device is currently open in /dev/mapper/.
+    Returns True if open/active, False if closed/inactive.
+    No logging is performed here.
+    """
+    cmd = ['cryptsetup', 'status', luks_map_name]
+    try:
+        # check=False because a return code of 4 is expected when inactive
+        result = subprocess.run(cmd, check=False, capture_output=True, text=True)
+
+        if result.returncode == 0:
+            return True # Active (Open)
+        elif result.returncode == 4:
+            return False # Inactive (Closed)
+        else:
+            # Note: This is an unexpected status check failure, which we log but don't abort on
+            # as it might still be open/closed despite the bad exit code. We default to False (closed).
+            log_operation(f"Cryptsetup status check failed (Exit Code {result.returncode}): {result.stderr.strip()}", 'WARNING')
+            return False
+
+    except FileNotFoundError:
+        abort("cryptsetup command not found. Please install it.")
+    except Exception as e:
+        log_operation(f"Error checking LUKS status: {e}", 'WARNING')
+        return False
+
+
+def is_mounted(mountpoint):
+    """Checks if the mountpoint is currently in use, required for safety check."""
+    try:
+        with open('/proc/mounts', 'r') as f:
+            mounts = f.read()
+            if mountpoint in mounts:
+                for line in mounts.splitlines():
+                    if line.split()[1] == mountpoint:
+                        log_operation(f"Mountpoint {mountpoint} is currently active: {line.split()[0]}", 'INFO')
+                        return True
+        log_operation(f"Mountpoint {mountpoint} is not active.", 'INFO')
+        return False
+    except Exception as e:
+        log_operation(f"Could not verify mount status: {e}", 'WARNING')
+        return False
+
+def verify_mount(mountpoint):
+    """Verifies a mount by checking if 'df' reports a non-zero size for the mountpoint."""
+    log_operation(f"Verifying mount at {mountpoint} with df.", 'INFO')
+    try:
+        cmd = ['df', '-T', '-P', mountpoint]
+        # Set capture_output=True manually here to get the output from run_command
+        result = run_command(cmd, check=True, capture_output=True)
+
+        lines = result.stdout.strip().split('\n')
+        if len(lines) < 2:
+            log_operation("df output was empty or too short. Mount verification failed.", 'ERROR')
+            return False
+
+        data_line = lines[1]
+
+        columns = data_line.split()
+        if len(columns) < 3:
+             log_operation(f"df output line malformed: '{data_line}'. Mount verification failed.", 'ERROR')
+             return False
+
+        try:
+            total_blocks = int(columns[2])
+            if total_blocks > 0:
+                # echo the relevant 'df' line (familiar and most informative)
+                log_operation(f"\t{data_line}", 'INFO')
+                return True
+            else:
+                log_operation(f"Mount failed verification: Total blocks reported as zero on {mountpoint}.", 'ERROR')
+                return False
+        except ValueError:
+            log_operation(f"Could not parse blocks size from df output: '{columns[2]}'. Mount verification failed.", 'ERROR')
+            return False
+
+    except subprocess.CalledProcessError as e:
+        log_operation(f"df check failed (Exit Code {e.returncode}). Mount is likely invalid.", 'ERROR')
+        return False
+    except Exception as e:
+        log_operation(f"Unexpected error during mount verification: {e}", 'ERROR')
+        return False
+
+
+def run_open_operation(context, command_line):
+    """Handles the core LUKS open process."""
+    friendly_name = context['friendlyname']
+    luks_map_name = context['luks_mapname']
+    mapped_device_path = f"/dev/mapper/{luks_map_name}"
+
+    is_opened = check_luks_status(luks_map_name)
+
+    if not is_opened:
+        log_operation(f"Attempting to open LUKS device: {context['device']} -> {mapped_device_path}", 'INFO')
+
+        # PROMPT FOR PASSPHRASE HERE
+        try:
+            passphrase = getpass.getpass(f"Passphrase for {friendly_name} ({context['device']}): ")
+            # cryptsetup expects the passphrase followed by a newline character on stdin
+            input_data = passphrase + '\n'
+        except EOFError:
+            abort("Passphrase input failed (EOF). Aborting.", command_line)
+
+        # Use 'open_command' if available, otherwise fall back to 'unlock_command' (legacy)
+        open_cmd = substitute_template(context.get('open_command') or context.get('unlock_command'), context)
+
+        try:
+            # Pass the input_data (passphrase) to run_command
+            run_command(open_cmd, check=True, input_data=input_data)
+            log_operation("LUKS device successfully opened.", 'INFO')
+            return True # Successfully opened
+
+        except subprocess.CalledProcessError as e:
+            # Check for the common error where device is already mapped but not under our name
+            if 'already mapped or mounted' in e.stderr:
+                 log_operation(f"LUKS open failed: Device is busy. Try 'force-open' to resolve system-created maps.", 'ERROR')
+                 return False # Failed, likely due to system map conflict
+            elif e.returncode == 5 and ("already exists" in e.stderr or "Device specified already exists" in e.stderr):
+                log_operation("LUKS open failed because the mapname already exists. Assuming device is open.", 'WARNING')
+                return True # Treat as already opened/active
+            else:
+                abort("LUKS open failed. Check your passphrase and permissions. Aborting.", command_line)
+    else:
+        log_operation(f"LUKS device '{luks_map_name}' is already open (Active). Skipping open step.", 'INFO')
+        return True # Already open
+
+
+def run_unmount_operation(context, command_line):
+    """
+    Handles the core unmount process.
+    Aborts the script if the device is mounted and unmount fails.
+    """
+    mountpoint = context['mountpoint']
+
+    if not is_mounted(mountpoint):
+        log_operation(f"Mountpoint {mountpoint} is already unmounted. Skipping unmount step.", 'INFO')
+        return
+
+    try:
+        log_operation(f"Attempting to unmount {mountpoint}.", 'INFO')
+        umount_cmd = substitute_template(context.get('umount_command'), context)
+        run_command(umount_cmd, check=True)
+        log_operation("Volume successfully unmounted.", 'INFO')
+
+    except subprocess.CalledProcessError:
+        log_operation(f"Unmount failed for {mountpoint}. The device remains mounted.", 'ERROR')
+        abort("Aborting due to unmount failure.", command_line)
+    except ValueError as e:
+        abort(f"Configuration validation failed during unmount: {e}", command_line)
+
+
+def do_open(context, command_line):
+    """Executes the 'open' command logic."""
+    if not run_open_operation(context, command_line):
+        # Only abort if run_open_operation explicitly returns False (e.g., failed due to device busy error)
+        abort("Aborting 'open' command due to underlying operation failure.", command_line)
+
+
+def do_force_open(context, command_line):
+    """
+    Executes 'force-open': closes any existing system-created map for the device
+    and then opens it using the configured luks_mapname.
+    """
+    friendly_name = context['friendlyname']
+    luks_map_name = context['luks_mapname']
+    device_path = context['device']
+
+    log_operation(f"Executing force-open sequence for '{friendly_name}'.", 'START')
+
+    # 1. Check for system-created map
+    active_map_name = find_active_mapname(device_path)
+
+    if active_map_name and active_map_name == luks_map_name:
+        log_operation(f"LUKS device is already open under the correct map name ('{luks_map_name}'). Skipping force-open.", 'INFO')
+        return
+
+    elif active_map_name and active_map_name != luks_map_name:
+        log_operation(f"Found existing conflicting map '{active_map_name}' for {device_path}. Closing before re-opening.", 'WARNING')
+
+        # 2. Close the conflicting map
+        try:
+            # We use the raw 'cryptsetup close' command here
+            cmd = ['cryptsetup', 'close', active_map_name]
+            log_operation(f"Executing: {' '.join(cmd)}")
+            # Must run directly using subprocess as run_command adds logic we don't need/want here
+            subprocess.run(cmd, check=True, capture_output=True, text=True)
+            log_operation(f"Successfully closed conflicting map '{active_map_name}'.", 'INFO')
+        except subprocess.CalledProcessError as e:
+            # Fail hard if we can't close the conflicting map
+            log_operation(f"Failed to close conflicting map '{active_map_name}' (Exit Code {e.returncode}). Aborting force-open.", 'ERROR')
+            abort("Aborting due to device conflict cleanup failure.", command_line)
+        except FileNotFoundError:
+             abort("cryptsetup command not found. Please install it.")
+
+
+    # 3. Proceed with standard open operation
+    log_operation("Attempting standard LUKS open using configured friendly name.", 'INFO')
+    if not run_open_operation(context, command_line):
+        abort("LUKS open failed after closing system map. Check passphrase/permissions.", command_line)
+
+    log_operation("Force-open sequence completed successfully.", 'END')
+
+
+def do_close(context, command_line):
+    """Executes the 'close' command logic, including auto-unmount."""
+    luks_map_name = context['luks_mapname']
+
+    # 1. Check if currently open
+    is_opened = check_luks_status(luks_map_name)
+
+    if not is_opened:
+        log_operation(f"LUKS device '{luks_map_name}' is currently closed (Inactive). Skipping close operation.", 'INFO')
+        return
+
+    # Contextual log message for 'close' command when device is open
+    log_operation(f"LUKS device '{luks_map_name}' is currently open (Active). Proceeding with close sequence.", 'INFO')
+
+    # 2. Attempt Auto-Unmount (will abort if unmount fails)
+    run_unmount_operation(context, command_line)
+
+    # 3. Perform close
+    log_operation(f"Attempting to close LUKS device: {luks_map_name}", 'INFO')
+    # Use 'close_command' if available, otherwise fall back to 'lock_command' (legacy)
+    close_cmd = substitute_template(context.get('close_command') or context.get('lock_command'), context)
+
+    # Set check=False to prevent aborting on idempotent error (e.g., "already suspended")
+    close_result = run_command(close_cmd, check=False)
+
+    # --- 4. Final Status Check and Resolution ---
+    # Check the final status.
+    is_still_opened = check_luks_status(luks_map_name)
+
+    if not is_still_opened:
+        # Success path: Device is confirmed closed (status inactive).
+        log_operation("LUKS device successfully closed.", 'INFO')
+    else:
+        # Failure path: Device is still active. Analyze the error.
+
+        # Check for idempotent error message (e.g., from 'luksSuspend')
+        # We search for "already suspended" or "already active" (if using cryptsetup close on an inactive map)
+        idempotent_error = "already suspended" in close_result.stderr or "already active" in close_result.stderr
+
+        if idempotent_error:
+            # Idempotent Success Path: Command failed but target state was already achieved.
+            log_operation("Close command failed (Idempotent Error), but the device is now considered closed/suspended.", 'INFO')
+        else:
+            # Genuine Failure Path: Command failed and status is still active.
+            log_operation(f"LUKS close failed for {luks_map_name}. The device remains open.", 'ERROR')
+            abort("Aborting due to close failure.", command_line)
+
+
+def do_backup(context, command_line):
+    """Executes the main 'backup' command logic (open, mount, rsnapshot, unmount, close)."""
+    friendly_name = context['friendlyname']
+    luks_map_name = context['luks_mapname']
+    mountpoint = context['mountpoint']
+    mapped_device_path = f"/dev/mapper/{luks_map_name}"
+    rotation = context['rotation']
+
+    # Initial state tracking
+    opened_by_script = False
+
+    # --- 1. Check Mount State (Hard Error) ---
+    if is_mounted(mountpoint):
+        # Even though unmount is part of the cleanup, a backup run should start with an unmounted device
+        # unless it was left mounted from a prior interaction. Since the backup sequence handles
+        # unmount at the end, we still treat an active mount here as suspicious/unauthorized access.
+        abort(f"Hard Error: Target mountpoint {mountpoint} is already mounted/in-use. Aborting.", command_line)
+
+    # --- 2. Open (Conditional) ---
+    is_opened_before_call = check_luks_status(luks_map_name)
+
+    if not is_opened_before_call:
+        if run_open_operation(context, command_line):
+            opened_by_script = True
+        else:
+            # If run_open_operation fails (returns False), it's likely due to a system map conflict.
+            # We advise using 'force-open' but proceed to abort since we can't recover here.
+            abort("LUKS open failed. Try using 'force-open' if the device was auto-opened by the system. Aborting backup.", command_line)
+    else:
+        log_operation(f"LUKS device '{luks_map_name}' was already open (Active). Skipping open step.", 'INFO')
+
+    # --- 3. Mount Volume ---
+    # The mountpoint directory must exist
+    if not os.path.isdir(mountpoint):
+        log_operation(f"Mountpoint {mountpoint} does not exist. Creating directory.", 'INFO')
+        os.makedirs(mountpoint, exist_ok=True)
+
+    log_operation(f"Attempting to mount {mapped_device_path} to {mountpoint}", 'INFO')
+    mount_cmd = substitute_template(context.get('mount_command'), context)
+
+    try:
+        run_command(mount_cmd, check=True)
+
+        if not verify_mount(mountpoint):
+            raise Exception("Mount verification failed: df check returned zero blocks.")
+
+        log_operation("Volume successfully mounted and verified.", 'INFO')
+
+    except subprocess.CalledProcessError:
+        log_operation("Mount operation failed. Proceeding to cleanup LUKS (if needed).", 'ERROR')
+        if opened_by_script:
+            log_operation("Attempting to reclose LUKS due to mount failure.", 'WARNING')
+            close_cmd = substitute_template(context.get('close_command') or context.get('lock_command'), context)
+            run_command(close_cmd, check=False)
+        abort("Aborting due to mount failure.", command_line)
+    except (ValueError, Exception) as e:
+        log_operation(f"Mount configuration or verification failed: {e}", 'ERROR')
+        if opened_by_script:
+            log_operation("Attempting to reclose LUKS due to mount failure.", 'WARNING')
+            close_cmd = substitute_template(context.get('close_command') or context.get('lock_command'), context)
+            run_command(close_cmd, check=False)
+        abort("Aborting due to mount failure.", command_line)
+
+
+    # --- 4. Rsnapshot Backup ---
+    try:
+        log_operation(f"Starting rsnapshot backup for '{friendly_name}' with rotation '{rotation}'.", 'INFO')
+        rsnapshot_cmd = substitute_template(context.get('rsnapshot_command'), context)
+        # rsnapshot_cmd output may be huge. Also, it is logged by rsnapshot itself anyway.
+        run_command(rsnapshot_cmd, check=True, log_output=False)
+        log_operation("Rsnapshot completed successfully (see /var/log/rsnapshot-*.log).", 'INFO')
+
+    except subprocess.CalledProcessError:
+        log_operation("Rsnapshot failed. Check /var/log/rsnapshot-*.log for details (and look for STDERR output above).", 'ERROR')
+
+    # --- 5. Unmount ---
+    # This calls the reusable unmount function. It will abort on failure.
+    run_unmount_operation(context, command_line)
+
+    # --- 6. Close (Conditional) ---
+    try:
+        if opened_by_script:
+            log_operation(f"Attempting to reclose LUKS device: {luks_map_name}", 'INFO')
+            close_cmd = substitute_template(context.get('close_command') or context.get('lock_command'), context)
+
+            # Use check=False for reclose in cleanup, then verify status
+            close_result = run_command(close_cmd, check=False)
+
+            is_still_opened = check_luks_status(luks_map_name)
+
+            if not is_still_opened:
+                 log_operation("LUKS device successfully reclosed.", 'INFO')
+            else:
+                 # Check for idempotent error during cleanup
+                 if "already suspended" in close_result.stderr or "already active" in close_result.stderr:
+                    log_operation("LUKS device was already reclosed/suspended. Cleanup considered successful.", 'INFO')
+                 else:
+                    log_operation("LUKS reclose failed during cleanup. The device remains open.", 'ERROR')
+        else:
+            log_operation("LUKS device was pre-opened, skipping reclose to preserve state.", 'INFO')
+
+    except Exception as e:
+        log_operation(f"Unexpected error during LUKS reclose cleanup: {e}", 'ERROR')
+
+
+
+# --- Main Execution ---
+
+def main():
+
+    # Sudo Check and Re-execution
+    if os.geteuid() != 0:
+        if 'NEBAK_REEXEC' in os.environ:
+            abort("Self-re-execution with sudo failed. Aborting to prevent infinite loop.")
+
+        log_operation("Not running as root. Re-executing with sudo...", 'WARNING')
+        os.environ['NEBAK_REEXEC'] = '1'
+        try:
+            # This executes 'sudo ./newbak [args]' relying on the shebang.
+            os.execvp('sudo', ['sudo'] + sys.argv)
+        except OSError as e:
+            abort(f"Failed to re-execute with sudo: {e}. Please ensure you can run sudo without password or fix permissions.")
+
+
+    # --- 1. Init: Argument and Config Parsing ---
+    command, target_id, rotation = parse_args(sys.argv[1:])
+
+    config_path = find_config_file()
+    if not config_path:
+        # If config is missing, print a simple error and exit (cannot print full usage)
+        abort(f"Configuration file '{CONFIG_FILE_NAME}' not found in search paths.")
+
+    full_config = load_config(config_path)
+
+    if command == 'help':
+        print_usage(full_config)
+        return
+
+    # --- 2. Init: Discovery and Context ---
+    # Reconstruct command line for logging.
+    if command == 'backup' and sys.argv[1].lower() not in MAIN_COMMANDS:
+        command_line = f"newbak " + ' '.join(sys.argv[1:])
+    else:
+        command_line = f"newbak {command} " + ' '.join(sys.argv[2:])
+
+    try:
+        context = get_device_info(target_id, full_config)
+        context['rotation'] = rotation
+    except Exception as e:
+        abort(f"Device initialization failed: {e}", command_line)
+
+    log_operation(f"Target: {context['friendlyname']} (UUID: {context['uuid']})", 'INFO')
+    log_operation(f"Physical Device: {context['device']}", 'INFO')
+
+    # --- 3. Execute Command Workflow ---
+    log_operation(command_line, 'START') # GLOBAL START DECORATION
+
+    if command == 'open':
+        do_open(context, command_line)
+    elif command == 'force-open':
+        do_force_open(context, command_line)
+    elif command == 'close':
+        do_close(context, command_line)
+    elif command == 'backup':
+        do_backup(context, command_line)
+    else:
+        # Should be unreachable due to parse_args filtering
+        abort(f"Unknown command: {command}")
+
+    # --- 4. Final Log Entry ---
+    log_operation(command_line + ' ended', 'END') # GLOBAL END DECORATION
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except ImportError:
+        print("Error: The 'PyYAML' library is required. Install it using: pip install PyYAML", file=sys.stderr)
+        sys.exit(1)
+    except Exception as e:
+        log_operation(f"CRITICAL PYTHON ERROR: {e}", 'ERROR')
+        sys.exit(1)
