@@ -25,7 +25,7 @@ Available Targets:
 ## Overview
 
 *newbak* is a single-file python script.
-It relies on strong existing foundations (avoid reinventing the wheel) to do the heavy lifting.
+It relies on strong existing foundations (avoids reinventing the wheel) to do the heavy lifting.
 
 The main benefit to the end user is simplicity of use.
 Once a device is configured, there's no longer a need to remember any of the details that are required.
@@ -44,26 +44,26 @@ Want to use a different encryption scheme?
 Use a different mount/unmount scheme?
 Call a different incremental-backup tool? 
 
-Every implementation detail is configurable.
+Implementation details are configurable.
 Just edit `newbak-conf.yaml` and/or your `rsnapshot-<volume>.conf` to your liking.
 
 
 ## Configuration
 
 There is one top-level configuration file: `newbak-conf.yaml`,
-plus another \<N\> `rsnapshot` configuration-files, (one for each specific volume backup).
+plus optional \<N\> `rsnapshot-*` configuration-files, (one for each specific volume backup).
 
   - `newbak-conf.yaml` - top level config of backup volumes, and underlying commands
-  - `rsnapshot.conf` - backup details: what content to back-up, how many periodic backups to keep etc.
+  - `rsnapshot-<somename>.conf` - backup details: what content to back-up, how many periodic backups to keep etc.
     (this is a per-volume configuration, so if you want different contents backed-up, you can have multiple of these)
 
-See `man rsnapshot` for `rsnapshot` configuration details.
-An example is provided here in [rsnapshot-pam.conf](rsnapshot-pam.conf)
+See `man rsnapshot` for the `rsnapshot` configuration details.
+An example is provided in [rsnapshot-pam.conf](rsnapshot-pam.conf)
 
 ## Example crontab
 
 Assuming devices are physically connected you may schedule your backups via cron.
-Here's an example:
+Here's an example for a certain schedule running various periodic backups:
 ```
 # -- 'hourly' backup: every 6 hours at xx:04
 4 */6 * * * sudo newbak pam hourly
@@ -74,6 +74,8 @@ Here's an example:
 # -- 'monthly' backup: 1st of the month @ 2:21 am
 21 2 1 * *  sudo newbak pam monthly
 ```
+Note: you would need to configure `sudo` (see: *`man sudoers`*) in order to not require a password
+when running `sudo` jobs via cron.
 
 ## Requirements (and tested with)
 
@@ -84,7 +86,7 @@ Here's an example:
 ## Licence
 
 Open source. BSD 2-clause (classic license)
-Basically, do whatever you want wth it as long as you:
+Basically, do whatever you want with this code as long as you:
 
   - Give credit (don't claim it as your own)
   - Promise not to sue the author for damages
