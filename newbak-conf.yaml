@@ -17,12 +17,12 @@
 # script when possible. ${...} variable are substituted before calling any <whatever>_command.
 #
 # The following template variables are auto-populated by the newbak utility
-#   ${rotation}     set by default to 'hourly'
+#   ${rotation}     Incremental backup period: 'hourly' (default), 'daily', 'weekly', or 'monthly'
 #   '${device}'     auto-discovered (see script)
 #
 # These are conveniently self-defined:
-#   ${friendlyname}     our preferred backup key
-#   ${luks_mapname}     /dev/mapper/${luks_mapname} symlink,
+#   ${friendlyname}     Our preferred backup key or name (short string, e.g. 'evo860')
+#   ${luks_mapname}     basename of device-mapper symlink (/dev/mapper/${luks_mapname})
 #                       Pretty arbitrary. Can be the same as ${friendlyname} for convenience/simplicity
 #---------------------------------------------------------------------------
 
@@ -33,10 +33,9 @@ open_command: ['cryptsetup', 'open', '${device}', '${friendlyname}']
 
 close_command: ['cryptsetup', 'close', '${luks_mapname}']
 
-mount_command: ['mount', '-O', 'noauto,noexec,relatime', '/dev/mapper/${luks_mapname}', '${mountpoint}']
+mount_command: ['mount', '-O', 'noauto,noexec,noatime', '/dev/mapper/${luks_mapname}', '${mountpoint}']
 
-# Using lazy unmounts to reduce chances of race-conditions, stuck processes, dirty filesystems
-umount_command: ['umount', '-l', '${mountpoint}']
+umount_command: ['umount', '${mountpoint}']
 
 # 'rsnapshot' must be passed a rsnapshotconf configuration file after the '-c'
 # Also requires mandatory ${rotation} (hourly, daily, weekly, monthly) arg
