@@ -262,28 +262,31 @@ def find_active_mapname(device_path):
 
 def check_luks_status(luks_map_name):
     """Checks if the LUKS device is currently open."""
+    # This is buggy: tunring off/on the device loses the secrets (device is effectively closed)
+    # 'cryptsetup status <luks_map_name>' says "<luks_map_name> is active and is in use."
+    # but 'lsblk' shows no inner LUKS device (TYPE=crypt) so content can't be accessed
     cmd = ['cryptsetup', 'status', luks_map_name]
     try:
-        result = subprocess.run(cmd, check=False, capture_output=True, text=True)
+        result = subprocess.run(cmd, check=False, capture_output=True)
         return result.returncode == 0
     except Exception:
         return False
 
 def is_mounted(mountpoint):
-    """Checks if the mountpoint is currently in use."""
+    """Checks if mountpoint is active."""
     try:
         with open('/proc/mounts', 'r', encoding='latin1') as f:
-            mounts = f.read()
-            if mountpoint in mounts:
-                for line in mounts.splitlines():
-                    if line.split()[1] == mountpoint:
-                        return True
-        return False
+            return any(line.split()[1] == mountpoint for line in f.readlines())
     except Exception:
         return False
 
-def verify_mount(mountpoint):
-    """Verifies a mount by checking size with df."""
+def check_df_mount(mountpoint):
+    """
+    Verifies a mount by looking at the mountpoint via 'df'.
+    Similar to 'is_mounted', but also logs the matching 'df' line (example):
+        /dev/mapper/evo860 ext4      1.8T  819G  921G  48% /media/evo860
+    This 'df' output is critical for monitoring (Used%) of the mounted volume over time
+    """
     try:
         cmd = ['df', '-TPh', mountpoint]
         result = run_command(cmd, check=True, capture_output=True)
@@ -304,7 +307,6 @@ def run_open_operation(context, command_line):
     if check_luks_status(luks_map_name):
         log_operation(f"LUKS device '{luks_map_name}' is already open.", 'INFO')
         return True
-
     try:
         passphrase = getpass.getpass(f"Passphrase for {context['friendlyname']} ({context['device']}): ")
         input_data = passphrase + '\n'
@@ -417,23 +419,25 @@ def do_backup(context, command_line):
     mount_cmd = substitute_template(context.get('mount_command'), context)
     try:
         run_command(mount_cmd, check=True)
-        if not verify_mount(mountpoint):
-            # pylint: disable=broad-exception-raised
-            raise Exception("Mount verification failed.")
+        # Log how full the volume is (Use%)
+        if not check_df_mount(mountpoint):
+            abort("Mount failure (no 'df' line).", command_line)
     except Exception:
         if opened_by_script:
-            do_close(context, command_line)
+            run_command(substitute_template(context.get('close_command'), context), check=False)
         abort("Mount failure.", command_line)
 
     try:
         rsnapshot_cmd = substitute_template(context.get('rsnapshot_command'), context)
         run_command(rsnapshot_cmd, check=True, log_output=False)
-    except subprocess.CalledProcessError:
+        log_operation("Rsnapshot completed successfully.")
+
+    except Exception:
         log_operation("Rsnapshot failed.", 'ERROR')
 
     run_unmount_operation(context, command_line)
     if opened_by_script:
-        do_close(context, command_line)
+        run_command(substitute_template(context.get('close_command'), context), check=False)
 
 
 def main():
