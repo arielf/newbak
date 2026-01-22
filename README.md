@@ -1,9 +1,23 @@
 # newbak - configurable backup utility
 
+## TL;DR
+
+newbak is a utlity for automating multiple backups on Linux systems.
+
+**Highlights:**
+
+    - Highly configurable backups via human-readable config-files
+    - Encrypted volumes (e.g. LUKS)
+    - Incremental backups (via rsnapshot)
+    - Scheduled backups  (via cron)
+    - Idempotency (preserve state in the face of errors)
+    - Friendly & informative error messages and usage
+    - Good logging
+
 ## Usage
 
-Usage example.
-The script prints the usage message when called with no parameters.
+Usage example (fictional names and details).
+The script prints the usage message when called with no parameters, like this.
 
 ```
 Usage: newbak [backup] <friendly-name|UUID> [rotation]
@@ -14,6 +28,7 @@ Commands:
   open <target>               Only performs the LUKS open operation.
   force-open <target>         Closes any active system-created map on the device, then opens it with the configured friendly-name.
   close <target>              Auto-unmounts the target if mounted, then performs the LUKS close operation.
+  fsck <target>               Perform file-system-check (fsck) on target
   help                        Shows this usage guide.
 
 Available Targets:
@@ -22,7 +37,7 @@ Available Targets:
   sandisk64      (UUID: 1a78bd05-934b-4ad2-af63-d32f32cd828f, Mount: /media/sd64)
 ```
 
-## Overview
+## Detailed overview
 
 *newbak* is a single-file python script.
 It relies on strong existing foundations (avoids reinventing the wheel) to do the heavy lifting.
@@ -42,7 +57,7 @@ You can configure it as much as you want.
 
 Want to use a different encryption scheme?
 Use a different mount/unmount scheme?
-Call a different incremental-backup tool? 
+Call a different incremental-backup tool?
 
 Implementation details are configurable.
 Just edit `newbak-conf.yaml` and/or your `rsnapshot-<volume>.conf` to your liking.
