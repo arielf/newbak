@@ -1,12 +1,21 @@
 #!/usr/bin/env python3
 # vim: textwidth=120
-# pylint: disable=line-too-long,broad-exception-caught,redefined-outer-name
+# pylint: disable=line-too-long,broad-exception-caught,redefined-outer-name,multiple-statements
 # pylint: disable=too-many-branches,too-many-statements,too-many-return-statements
 """
-newbak - Incremental Backup Automation Tool
+newbak - Configurable Incremental Backup Automation Tool
 
-Automates incremental backups of a local Linux system onto connected LUKS-encrypted disks
-using rsnapshot. Also provides explicit open/close commands.
+Automates incremental backups of a local Linux system onto multiple connected volumes
+Highly configurable via easy (to edit + understand) newback-conf.yaml file.
+
+Supports LUKS-encrypted disks, incremental backups (via rsnapshot), and more.
+
+Also supports useful granular operations:
+    - on/off: bring devices online/offline
+    - open/close (unlock/lock) encryption
+    - fsck: file-system check
+    - mount/umount
+    - full backup (optionally all the above)
 """
 import sys
 import subprocess
@@ -22,18 +31,18 @@ import yaml
 LOG_FILE = 'newbak.log'
 DEFAULT_ROTATION = 'hourly'
 ALLOWED_PERIODS = ['hourly', 'daily', 'weekly', 'monthly']
-MAIN_COMMANDS = ['backup', 'close', 'open', 'force-open', 'fsck', 'help']
+MAIN_COMMANDS = ['backup', 'close', 'open', 'force-open', 'fsck', 'mount', 'umount', 'on', 'off', 'help' ]
 UUID_REGEX = re.compile(r'^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$', re.IGNORECASE)
 CONFIG_PATHS = [
     Path('.'),
     Path('~/.config/newbak').expanduser()
 ]
 CONFIG_FILE_NAME = 'newbak-conf.yaml'
-
+DEBUG = False
 
 # pylint: disable=redefined-builtin
 def log_operation(message, type='INFO'):
-    """Logs a message with a strict timestamp format to the LOG_FILE."""
+    """Log a message with a strict timestamp format to the LOG_FILE."""
     timestamp = datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
 
     # Determine the prefix based on the type for the required log format
@@ -55,59 +64,84 @@ def log_operation(message, type='INFO'):
 
 
 def abort(message, command_line=None):
-    """Logs an error message and exits the script."""
+    """Log an error message and exit the script."""
     log_operation(f"ERROR: {message}", 'ERROR')
     if command_line:
         log_operation(command_line + ' ended', 'END')
     sys.exit(1)
 
 
+def dbg(message):
+    """Debugging function"""
+    print(message)
+
+
 def parse_args(args):
     """
-    Handles argument parsing for command and target.
+    Handle argument parsing for command and target.
     The 'backup' command is assumed if the first argument is not a known command.
     """
+    command, target_id, rotation = None, None, None
+    # pylint: disable=global-statement
+    global DEBUG
+
     if not args:
         return 'help', None, None
 
-    if args[0].lower() in MAIN_COMMANDS:
-        command = args[0].lower()
-        remaining = args[1:]
-    else:
-        command = 'backup'
-        remaining = args
+    for arg in args:
+        arglower =  arg.lower()
+        if arglower in ('-d', '-debug', '--debug'):
+            DEBUG = True
+            continue
+
+        if arglower in MAIN_COMMANDS:
+            if command:
+                abort(f"multiple commands given: {command} {arg}")
+            command = arglower
+            continue
+
+        if arglower in ALLOWED_PERIODS:
+            command = 'backup'
+            rotation = arglower
+            continue
+
+        if target_id:
+            abort(f"multiple target_ids given: {target_id} {arg}")
+
+        target_id = arg
+
 
     if command == 'help':
         return 'help', None, None
 
-    target_id = None
-    rotation = DEFAULT_ROTATION
-
-    for arg in remaining:
-        arg_lower = arg.lower()
-        if arg_lower in ALLOWED_PERIODS and command == 'backup':
-            rotation = arg_lower
-        else:
-            # The most recent non-rotation argument is treated as the target
-            target_id = arg
-
     if not target_id:
-        abort(f"Command '{command}' requires a target (friendlyname or UUID).")
+        abort(f"Command '{command}' requires a target volume (name or UUID).")
+
+    if not command:
+        # implied
+        command = 'backup'
+
+    if command == 'backup' and not rotation:
+        rotation = DEFAULT_ROTATION
 
     return command, target_id, rotation
 
 
 def print_usage(config):
-    """Prints the command usage guide."""
-    print("Usage: ./newbak [backup] <friendlyname|UUID> [rotation]")
-    print("       ./newbak <command> <friendlyname|UUID>")
+    """Print usage guide."""
+    print("Usage: newbak [backup] <name|UUID> [rotation]")
+    print("       newbak <command> <name|UUID>")
     print("\nCommands:")
-    print("  backup <target> [rotation]  Full cycle: open, mount, rsnapshot, unmount, close.")
-    print("  open <target>               LUKS open only.")
-    print("  force-open <target>         Close existing maps on device, then open.")
-    print("  close <target>              Unmount and LUKS close.")
-    print("  fsck <target>               Filesystem check (must be open but unmounted).")
-    print("  help                        Show this guide.")
+    print("  backup <target> [rotation]  Full cycle: [on], open, mount, rsnapshot, umount, close, [off]")
+    print("  open <target>               LUKS open (with optional [on]) only")
+    print("  force-open <target>         Close existing maps on device, then open")
+    print("  close <target>              Unmount and LUKS close (with optional [off])")
+    print("  fsck <target>               Filesystem check (must be open but inactive/unmounted)")
+    print("  on <target>                 Bring device online (turn on)")
+    print("  off <target>                Take device offline (turn off)")
+    print("  mount <target>              Mount volume (must be open)")
+    print("  umount <target>             Unmount volume (must be open & mounted)")
+    print("  help                        Show this guide")
     print("\nAvailable Targets:")
     for name, info in config.get('backups', {}).items():
         print(f"  {name:<15} (UUID: {info.get('uuid', 'N/A')}, Mount: {info.get('mountpoint', 'N/A')})")
@@ -115,7 +149,7 @@ def print_usage(config):
 
 
 def find_config_file():
-    """Searches for CONFIG_FILE_NAME in the specified paths."""
+    """Search for CONFIG_FILE_NAME in the specified paths."""
     for path in CONFIG_PATHS:
         config_path = path / CONFIG_FILE_NAME
         if config_path.is_file():
@@ -126,7 +160,7 @@ def find_config_file():
 
 # pylint: disable=inconsistent-return-statements
 def load_config(config_path):
-    """Loads and validates the backup configuration from the YAML file."""
+    """Load and validate the backup configuration from the YAML file."""
     try:
         with open(config_path, 'r', encoding='latin1') as f:
             config = yaml.safe_load(f)
@@ -134,11 +168,11 @@ def load_config(config_path):
             raise ValueError(f"{config_path}: 'backups' key missing.")
         return config
     except Exception as e:
-        abort(f"Configuration error: {e}")
+        abort(f"{config_path}: configuration error: {e}")
 
 
 def substitute_template(command_list, context):
-    """Substitutes ${variables} wherever they appear in command list elements."""
+    """Substitute ${variables} wherever they appear in command list elements."""
     if not command_list or not isinstance(command_list, list):
         return None
 
@@ -152,16 +186,32 @@ def substitute_template(command_list, context):
         for var_name, var_value in context.items():
             placeholder = f'${{{var_name}}}'
             new_item = new_item.replace(placeholder, str(var_value))
+
+        # Sanity check for plausible user-error: do we have any unsubstituted items?
+        if m := re.search(r'\$\{[^{}]*\}', new_item):
+            abort(f"Config error for volume {context['volname']}: undefined variable: {m.group(0)}")
+
         substituted_list.append(new_item)
 
     return substituted_list
 
 
-def run_command(command_list, check=True, log_output=False, capture_output=True, input_data=None):
-    """Executes a shell command using subprocess."""
+# pylint: disable=too-many-arguments
+def run_command(command_list,
+                check=True,
+                log_output=False,
+                capture_output=True,
+                stderr_ok_re=None,
+                input_data=None):
+    """
+    Execute a shell command using subprocess.
+    Does error handling & logging.
+    Support error override via 'stderr_ok_re': a stderr matching RegEx to consider a success
+    """
     if not command_list or not isinstance(command_list, list):
         raise TypeError("Configuration Error: A required command list is missing or invalid.")
 
+    result = None
     cmd_str = ' '.join(command_list)
     log_operation(f"Executing: {cmd_str}")
 
@@ -173,42 +223,62 @@ def run_command(command_list, check=True, log_output=False, capture_output=True,
             text=True,
             input=input_data
         )
-
         if log_output and result.stdout:
             for line in result.stdout.strip().split('\n'):
                 log_operation(line, type='DEVICE')
-
+        if DEBUG: dbg(f"run_command: all successful. returning result={result}")
         return result
     except subprocess.CalledProcessError as e:
-        log_operation(f"Command failed (Exit Code {e.returncode})", 'ERROR')
+        if DEBUG: dbg(f"run_command: exception hit: {e}. stderr={e.stderr}")
+
         if e.stderr:
-            for line in e.stderr.strip().split('\n'):
-                log_operation(line, type='ERROR')
+            if stderr_ok_re:
+                if m := re.search(stderr_ok_re, e.stderr):
+                    log_operation(f"Command success override: stderr match: '{m.group(0)}')", type='INFO')
+                    return e
+            else:
+                for line in e.stderr.strip().split('\n'):
+                    log_operation(line, type='ERROR')
+
+                log_operation(f"Command failed (Exit Code {e.returncode})", 'ERROR')
         raise
 
-
 def get_device_info(target_id, full_config):
-    """Identifies target and finds physical device path."""
+    """
+    Find physical device path for target_id
+    Retrieve the target_id context from full_config
+    Finally, return the expanded context which includes:
+        - volname
+        - device
+    """
     config = full_config['backups']
-    friendly_name = None
+    volume_name = None
 
     if target_id in config:
         info = config[target_id].copy()
-        friendly_name = target_id
+        volume_name = target_id
     else:
         info = next((v.copy() for k, v in config.items() if v.get('uuid') == target_id), None)
-        friendly_name = next((k for k, v in config.items() if v.get('uuid') == target_id), None)
+        volume_name = next((k for k, v in config.items() if v.get('uuid') == target_id), None)
 
     if not info:
-        abort(f"Target '{target_id}' not found in configuration.")
+        avail_names = ' '.join(config.keys())
+        abort(f"Target '{target_id}' not found in configuration: available names: {avail_names}")
 
     context = full_config.copy()
     context.update(info)
-    context['friendlyname'] = friendly_name
+    context['volname'] = volume_name
 
     for key in ['uuid', 'mountpoint', 'rsnapshotconf', 'luks_mapname']:
         if key not in context:
-            abort(f"Config for '{friendly_name}' missing key: '{key}'")
+            abort(f"Config for '{volume_name}' missing key: '{key}'")
+
+    # Devices that need turn on/off, must be brought online first
+    # otherwise they won't appear in 'lsblk' output
+    if context.get('on_command'):
+        # Alas: may need both turn-on + open, but this is a chicken/egg issue
+        # We can't do 'open' without knowing the device and there's no device before open :-(
+        turn_on(context)
 
     cmd = ['lsblk', '-J', '-o', 'NAME,UUID,TYPE']
     result = run_command(cmd, check=True, capture_output=True)
@@ -226,7 +296,7 @@ def get_device_info(target_id, full_config):
 
     device_path = find_device(lsblk_data.get('blockdevices', []))
     if not device_path:
-        abort(f"No physical device found for UUID {context['uuid']}.")
+        abort(f"No physical device found for {target_id}: UUID {context['uuid']}. Is it on?")
 
     context['device'] = device_path
     return context
@@ -261,8 +331,8 @@ def find_active_mapname(device_path):
 
 
 def check_luks_status(luks_map_name):
-    """Checks if the LUKS device is currently open."""
-    # This is buggy: tunring off/on the device loses the secrets (device is effectively closed)
+    """Check if the LUKS device is currently open."""
+    # This is buggy: tunring a dvice off/on loses the secrets (device is effectively closed)
     # 'cryptsetup status <luks_map_name>' says "<luks_map_name> is active and is in use."
     # but 'lsblk' shows no inner LUKS device (TYPE=crypt) so content can't be accessed
     cmd = ['cryptsetup', 'status', luks_map_name]
@@ -272,17 +342,37 @@ def check_luks_status(luks_map_name):
     except Exception:
         return False
 
+
 def is_mounted(mountpoint):
-    """Checks if mountpoint is active."""
+    """Check if mountpoint is active."""
     try:
         with open('/proc/mounts', 'r', encoding='latin1') as f:
             return any(line.split()[1] == mountpoint for line in f.readlines())
     except Exception:
         return False
 
+
+def is_open(volname):
+    """Check if a volume is open (luks encryption unlocked)."""
+    cmd = ['lsblk', '-o', 'NAME,TYPE']          # external command we run
+    openvol_re = f'\\b{volname}\\s+crypt$'      # pattern we're looking for (success)
+    try:
+        result = run_command(cmd, check=False, capture_output=True)
+        lines = result.stdout.strip().split('\n')
+        for line in lines:
+            if re.search(openvol_re, line):
+                return True
+
+        if DEBUG: dbg(f"is_open({volname}): success but device isn't open! Returning False")
+        return False
+
+    except Exception as e:
+        if DEBUG: dbg(f"is_open({volname}): exception {e}")
+        return False
+
 def check_df_mount(mountpoint):
     """
-    Verifies a mount by looking at the mountpoint via 'df'.
+    Verify a mount by looking at the mountpoint via 'df'.
     Similar to 'is_mounted', but also logs the matching 'df' line (example):
         /dev/mapper/evo860 ext4      1.8T  819G  921G  48% /media/evo860
     This 'df' output is critical for monitoring (Used%) of the mounted volume over time
@@ -298,23 +388,102 @@ def check_df_mount(mountpoint):
                 log_operation(f"\t{lines[1]}", 'INFO')
                 return True
         return False
-    except Exception:
+    except Exception as e:
+        if DEBUG: dbg(f"check_df_mount({mountpoint}): {e}")
         return False
 
-def run_open_operation(context, command_line):
-    """Handles the core LUKS open process."""
-    luks_map_name = context['luks_mapname']
-    if check_luks_status(luks_map_name):
-        log_operation(f"LUKS device '{luks_map_name}' is already open.", 'INFO')
+
+def turn_off(context):
+    """
+    Execute 'off' command.
+
+    Always 'succeeds' (by doing nothing iff the device doesn't support the 'off_command')
+
+    We can NOT check status of the on/off state beforehand because /sys/bus/usb/drivers/usb/unbind
+    is a single write-only pseudo-device:
+        --w------- 1 root root 4096 Feb  1 21:32 /sys/bus/usb/drivers/usb/unbind
+    We can only check exit-status of the operation after the fact.
+    A 'failure' when run as root means it was already at the wanted state.
+
+    Always 'succeeds' (by doing nothing, or by idempotency)
+    This is a safe (no-op) for any devices that don't explicitly configure an 'off_command'
+    """
+    raw_off_command = context.get('off_command')
+    if not raw_off_command:
+        # Volume doesn't have any 'off_command' configured.
+        # IOW: device doesn't need to be brought online/offline (e.g. it is permanently connected)
+        # Nothing to do: silent success
         return True
+
+    off_cmd = substitute_template(raw_off_command, context)
+    if run_command(off_cmd, check=True, log_output=True):
+        log_operation("Device turned off.", 'INFO')
+        return True
+
+    # 'Failure' of command means it was already on
+    log_operation("Device was already turned off.", 'INFO')
+    return True
+
+
+def turn_on(context):
+    """
+    Execute 'on' command for the volume, IFF configured for this context.
+
+    We can NOT check status of the on/off state beforehand because /sys/bus/usb/drivers/usb/bind
+    is a single write-only pseudo-device:
+        --w------- 1 root root 4096 Feb  1 21:32 /sys/bus/usb/drivers/usb/bind
+    We can only check exit-status of the operation after the fact.
+    A 'failure' when run as root means it was already at the wanted state.
+
+    This is a safe no-op for devices which don't explicitly configure an 'on_command'
+    Always succeeds (either by doing nothing, or by idempotency)
+    """
+    raw_on_cmd = context.get('on_command')
+    if not raw_on_cmd:
+        # Configuration doesn't specify an 'on_command' for this context:
+        #   i.e. device doesn't need to be brought online (e.g. it is permanently connected)
+        # Nothing to do: silent success
+        return True
+
+    on_cmd = substitute_template(raw_on_cmd, context)
+    if DEBUG: dbg(f"turn_on: after substitute_template: '{raw_on_cmd}' -> '{on_cmd}'")
+    if run_command(on_cmd, check=True, stderr_ok_re='write error: Device or resource busy'):
+        log_operation("Device turned on.", 'INFO')
+        return True
+
+    # 'Failure' of 'on' command that prints:
+    #       write error: Device or resource busy
+    # means the device was already on
+    log_operation("Device was already turned on.", 'INFO')
+    return True
+
+
+def run_open_operation(context, command_line):
+    """Handle the core LUKS open process."""
+    # Must be on, iff (volume is offline && on_command is configured in context)
+    if context.get('on_command'):
+        turn_on(context)
+
+    volname = context['volname']
+
+    # -- 'check_luks_status' is unreliable.
+    # -- Use the more reliable 'is_open' primitive (lsblk output)
+    # luks_map_name = context['luks_mapname']
+    # if check_luks_status(luks_map_name):
+    #    log_operation(f"LUKS device '{luks_map_name}' is already open.", 'INFO')
+    #    return True
+    if is_open(volname):
+        log_operation(f"volume '{volname}' is already LUKS open.", 'INFO')
+        return True
+
     try:
-        passphrase = getpass.getpass(f"Passphrase for {context['friendlyname']} ({context['device']}): ")
+        passphrase = getpass.getpass(f"Passphrase for {volname}: ")
         input_data = passphrase + '\n'
     except EOFError:
         abort("Passphrase input failed.", command_line)
 
-    open_cmd = substitute_template(context.get('open_command'), context)
     try:
+        open_cmd = substitute_template(context.get('open_command'), context)
         run_command(open_cmd, check=True, input_data=input_data)
         log_operation("LUKS device successfully opened.", 'INFO')
         return True
@@ -325,29 +494,41 @@ def run_open_operation(context, command_line):
         abort("LUKS open failed. Check passphrase.", command_line)
     return False
 
-def run_unmount_operation(context, command_line):
-    """Handles unmount process."""
+
+def run_umount_operation(context, command_line):
+    """fail-safe/idempotent un-mount op"""
     mountpoint = context['mountpoint']
     if not is_mounted(mountpoint):
+        # fail-safe: when not mounted, this is a safe no-op.
         return
 
     try:
-        log_operation(f"Attempting to unmount {mountpoint}.", 'INFO')
+        # log_operation(f"Attempting to umount {mountpoint}.", 'INFO')
         umount_cmd = substitute_template(context.get('umount_command'), context)
         run_command(umount_cmd, check=True)
     except subprocess.CalledProcessError:
-        abort("Aborting due to unmount failure.", command_line)
+        abort("Aborting due to umount failure.", command_line)
 
 
-def do_open(context, command_line):
-    """Executes 'open' command."""
-    if not run_open_operation(context, command_line):
-        abort("Aborting 'open' command due to failure.", command_line)
+def run_mount_operation(context, command_line):
+    """fail-safe/idempotent mount op"""
+    mountpoint = context['mountpoint']
+    if is_mounted(mountpoint):
+        log_operation(f"mount: {mountpoint} is already mounted")
+        return
+
+    try:
+        # log_operation(f"Attempting to mount {mountpoint}.", 'INFO')
+        mount_cmd = substitute_template(context.get('mount_command'), context)
+        run_command(mount_cmd, check=True)
+    except subprocess.CalledProcessError:
+        abort("Aborting due to mount failure.", command_line)
 
 
 def do_force_open(context, command_line):
     """
-    Closes conflicting system map then opens
+    Close conflicting system map then opens
+
     The system remembers/caches a LOT of info on each mapped device.
     See e.g. the output of:
         udevadm info /dev/mapper/evo970ext
@@ -356,18 +537,28 @@ def do_force_open(context, command_line):
     if active_map_name and active_map_name != context['luks_mapname']:
         log_operation(f"Closing conflicting map '{active_map_name}'.", 'WARNING')
         subprocess.run(['cryptsetup', 'close', active_map_name], check=True)
+        #--do we want this too?--#
+        run_command(['dmsetup', 'remove', active], check=False)
 
     if not run_open_operation(context, command_line):
         abort("Force-open failed.", command_line)
 
 
-def do_close(context, command_line):
-    """Executes 'close' command."""
+def run_close_operation(context, command_line):
+    """Execute 'close' command."""
     luks_map_name = context['luks_mapname']
-    if not check_luks_status(luks_map_name):
+    # Not a reliable check, commented out
+    # if not check_luks_status(luks_map_name):
+    #    return
+    volname = context['volname']
+    if not is_open(volname):
+        # Already closed...
+        turn_off(context)       # make sure the device is turned-off (if supported)
         return
 
-    run_unmount_operation(context, command_line)
+    # Device is open and needs closing. First, make sure it is unmounted
+    run_umount_operation(context, command_line)
+
     close_cmd = substitute_template(context.get('close_command'), context)
     run_command(close_cmd, check=False)
 
@@ -375,16 +566,23 @@ def do_close(context, command_line):
         abort("LUKS close failed.", command_line)
     log_operation("LUKS device closed.", 'INFO')
 
+    # Optionally turn-off device
+    turn_off(context)
+
 
 def do_fsck(context, command_line):
-    """Executes fsck."""
+    """Execute fsck."""
     luks_map_name = context['luks_mapname']
-    if not check_luks_status(luks_map_name):
+    volname = context['volname']
+    # if not check_luks_status(luks_map_name):
+    if not is_open(volname):
         log_operation(f"Opening {luks_map_name} for fsck...")
         if not run_open_operation(context, command_line):
             abort("Could not open LUKS device.", command_line)
 
-    run_unmount_operation(context, command_line)
+        context['opened-by-script'] = True
+
+    run_umount_operation(context, command_line)
 
     fsck_cmd = substitute_template(context.get('fsck_command'), context)
     if not fsck_cmd:
@@ -393,6 +591,10 @@ def do_fsck(context, command_line):
     try:
         run_command(fsck_cmd, check=True, log_output=True)
         log_operation("fsck completed successfully.")
+
+        if context.get('opened-by-script'):
+            run_close_operation(context, command_line)
+
     except subprocess.CalledProcessError as e:
         if e.returncode == 1:
             log_operation("fsck corrected filesystem errors.", 'WARNING')
@@ -401,17 +603,17 @@ def do_fsck(context, command_line):
 
 
 def do_backup(context, command_line):
-    """Executes full backup workflow."""
+    """Execute full backup workflow."""
     luks_map_name = context['luks_mapname']
     mountpoint = context['mountpoint']
-    opened_by_script = False
+    context['opened-by-script'] = False         # Was: opened_by_script = False
 
     if is_mounted(mountpoint):
         abort(f"Target {mountpoint} is already mounted.", command_line)
 
     if not check_luks_status(luks_map_name):
         if run_open_operation(context, command_line):
-            opened_by_script = True
+            context['opened-by-script'] = True
         else:
             abort("LUKS open failed.", command_line)
 
@@ -423,7 +625,7 @@ def do_backup(context, command_line):
         if not check_df_mount(mountpoint):
             abort("Mount failure (no 'df' line).", command_line)
     except Exception:
-        if opened_by_script:
+        if context.get('opened-by-script'):
             run_command(substitute_template(context.get('close_command'), context), check=False)
         abort("Mount failure.", command_line)
 
@@ -435,9 +637,11 @@ def do_backup(context, command_line):
     except Exception:
         log_operation("Rsnapshot failed.", 'ERROR')
 
-    run_unmount_operation(context, command_line)
-    if opened_by_script:
-        run_command(substitute_template(context.get('close_command'), context), check=False)
+    run_umount_operation(context, command_line)
+
+    if context.get('opened-by-script'):
+        # includes optional/no-op turn_off
+        run_close_operation(context, command_line)
 
 
 def main():
@@ -462,24 +666,25 @@ def main():
     log_operation(command_line, 'START')
     if command == 'fsck':
         do_fsck(context, command_line)
+    elif command == 'mount':
+        run_mount_operation(context, command_line)
+    elif command == 'umount':
+        run_umount_operation(context, command_line)
     elif command == 'open':
         run_open_operation(context, command_line)
     elif command == 'force-open':
-        active = find_active_mapname(context['device'])
-        if active:
-            run_command(['cryptsetup', 'close', active])
-        run_open_operation(context, command_line)
-    elif command == 'close':
-        run_unmount_operation(context, command_line)
-        run_command(substitute_template(context.get('close_command'), context), check=False)
+        do_force_open(context, command_line)
+    elif command in ('close', 'off'):
+        # 'close' means no more encrypted-volume dev-mapping,
+        #         for offline devices, this implies a (configurable) turn-off
+        #         which is a safe no-op for devices that don't support it.
+        # 'off' means a complete take-offline. Implies: [[umount] close] off
+        run_umount_operation(context, command_line)
+        run_close_operation(context, command_line)
     elif command == 'backup':
         do_backup(context, command_line)
 
     log_operation(command_line + ' ended', 'END')
 
 if __name__ == "__main__":
-    try:
-        main()
-    except Exception as e:
-        log_operation(f"CRITICAL ERROR: {e}", 'ERROR')
-        sys.exit(1)
+    main()

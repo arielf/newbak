@@ -2,15 +2,15 @@
 
 ## TL;DR
 
-newbak is a utlity for automating multiple backups on Linux systems.
+newbak is a utility for automating multiple backups on Linux systems.
 
 **Highlights:**
 
     - Highly configurable backups via human-readable config-files
     - Encrypted volumes (e.g. LUKS)
     - Incremental backups (via rsnapshot)
-    - Scheduled backups  (via cron)
-    - Idempotency (preserve state in the face of errors)
+    - Scheduled backups (via cron)
+    - Idempotency (preserve device state in the face of errors)
     - Friendly & informative error messages and usage
     - Good logging
 
@@ -24,12 +24,16 @@ Usage: newbak [backup] <friendly-name|UUID> [rotation]
        newbak <command> <friendly-name|UUID>
 
 Commands:
-  backup <target> [rotation]  Performs full open, mount, rsnapshot, unmount, and close (default command).
-  open <target>               Only performs the LUKS open operation.
-  force-open <target>         Closes any active system-created map on the device, then opens it with the configured friendly-name.
-  close <target>              Auto-unmounts the target if mounted, then performs the LUKS close operation.
+  backup <target> [rotation]  Performs full [on], open, mount, rsnapshot, unmount, close, [off] (default command).
+  open <target>               LUKS open (with optional [on]) only
+  force-open <target>         Unmount and LUKS close (with optional [off])
+  close <target>              Auto-unmounts the target if mounted, then LUKS close (with optional [off])
   fsck <target>               Perform file-system-check (fsck) on target
-  help                        Shows this usage guide.
+  on <target>                 Bring device online (turn on) if so configured (otherwise a no-op)
+  off <target>                Take device offline (turn off) if so configured (otherwise a no-op)
+  mount <target>              Mount volume (must be open)
+  umount <target>             Unmount volume (must be open & mounted)
+  help                        Show this guide.
 
 Available Targets:
   pam            (UUID: 41255543-63a6-4320-aa14-738fb849187f, Mount: /media/pam)
@@ -40,10 +44,11 @@ Available Targets:
 ## Detailed overview
 
 *newbak* is a single-file python script.
-It relies on strong existing foundations (avoids reinventing the wheel) to do the heavy lifting.
+It relies on existing foundations (avoids reinventing the wheel) to do the heavy lifting.
 
 The main benefit to the end user is simplicity of use.
-Once a device is configured, there's no longer a need to remember any of the details that are required.
+Once a backup volume is configured, there's no longer a need to remember any of the details
+that are required to do the myriad of operations needed to run an elaborate back-up to that volume.
 
 `newbak` can be called either:
 
@@ -53,11 +58,12 @@ Once a device is configured, there's no longer a need to remember any of the det
 It supports incremental, periodic backups on Linux encrypted volumes.
 It has extensive and very clear logging so that any issue can be easily investigated and fixed
 
-You can configure it as much as you want.
+You can configure all the basic building-blocks needed for a backup:
 
-Want to use a different encryption scheme?
-Use a different mount/unmount scheme?
-Call a different incremental-backup tool?
+    - Bring a connected (but offline) physical device online (turn-on) or take it off-line (turn-off) on demand
+    - Use a different encryption scheme. Tested using cryptsetup + LUKS
+    - Use different mount/umount options
+    - Call a different incremental-backup tool. Tested using rsnapshot.
 
 Implementation details are configurable.
 Just edit `newbak-conf.yaml` and/or your `rsnapshot-<volume>.conf` to your liking.
@@ -97,6 +103,26 @@ when running `sudo` jobs via cron.
   - A modern Linux system
   - `cryptsetup` / luks (for full volume/disk encryption)
   - `rsnapshot` (swiss-army-knife for periodic, incremental backups, relies on `rsync` and `cp -al`)
+
+## Example /etc/crypttab
+
+For encrypted volumes, having a configured crypttab is recommended.
+This way the device mapper will use your friendly names (consistent with `newbak-conf.yaml`) under `/dev/mapper`.
+
+Here is an example.
+
+You may keep some volumes online and pre-opened (by running `newbak open <volumename>`)
+while others may remain closed (and will need a interactive-passphrase to open/unlock)
+
+The `noauto` option is to avoid trying to open+auto-mount these volumes during boot time.
+
+```
+# <name>        <device>                                        <password>      <options>
+evo860          UUID=81281072-90e1-0381-da71-238fd149100f       none            luks,noauto
+evo850          UUID=ed9b8e54-5af0-3d46-bcd9-a2e8b7a15b91       none            luks,noauto
+...
+
+```
 
 ## Licence
 
