@@ -1,8 +1,8 @@
 ---
-# yamllint disable rule:line-length
+# yamllint disable rule:line-length rule:comments rule:colons
 #
 #---------------------------------------------------------------------------
-# Config file for newbak utility
+# Example config file for the newbak utility
 #
 # Supports mutiple encrypted incremental backup-configs using friendly names
 # with idempotent/safe underlying action behaviour.
@@ -13,40 +13,52 @@
 #   Underlying commands (with additonal required parameters)
 #   Uses interpolated ${...} variable templates.
 #
-# They are defined further down inside each backups subsection or are auto-discovered by the
-# script when possible. ${...} variable are substituted before calling any <whatever>_command.
+#   Supported variables may be overriden further down inside each backups subsection.
+#   ${...} variable are substituted before calling any <whatever>_command.
 #
 # The following template variables are auto-populated by the newbak utility
 #   ${rotation}     Incremental backup period: 'hourly' (default), 'daily', 'weekly', or 'monthly'
-#   '${device}'     auto-discovered (see script)
+#   '${device}'     auto-discovered during runtime (see script)
 #
-# These are conveniently self-defined:
-#   ${friendlyname}     Our preferred backup key or name (short string, e.g. 'evo860')
+# newbak also sets:
+#   ${volname}          Our preferred/friendly backup 'key' (aka 'volume name'). A short string, e.g. 'evo860'
 #   ${luks_mapname}     basename of device-mapper symlink (/dev/mapper/${luks_mapname})
-#                       Pretty arbitrary. Can be the same as ${friendlyname} for convenience/simplicity
+#                       Pretty arbitrary. May be the same as ${volname} for convenience/simplicity
 #---------------------------------------------------------------------------
 
 #
-# -- encryption-support (lock & unlock the volume)
+# -- encryption-support: lock & unlock the volume. Requires passphrase to open
 #
-open_command: ['cryptsetup', 'open', '${device}', '${friendlyname}']
-
+open_command: ['cryptsetup', 'open', '${device}', '${volname}']
 close_command: ['cryptsetup', 'close', '${luks_mapname}']
 
+#
+# -- mount & unmount
+#
 mount_command: ['mount', '-O', 'noauto,noexec,noatime', '/dev/mapper/${luks_mapname}', '${mountpoint}']
-
 umount_command: ['umount', '${mountpoint}']
 
 # 'rsnapshot' must be passed a rsnapshotconf configuration file after the '-c'
 # Also requires mandatory ${rotation} (hourly, daily, weekly, monthly) arg
 rsnapshot_command: ['rsnapshot', '-D', '-c', '${rsnapshotconf}', '${rotation}']
 
+#
+# 'on' & 'off' commands to bring a plugged-in device online/offline
+#
+# Used for devices that are plugged via USB but normally turned off
+# Such devices need a 'bind' operation to turn on.
+# Typically, devices are permanently connected and always 'on' so these are no-op by default.
+# See example below on how to define them.
+#
+on_command: []
+off_command: []
+
 #---------------------------------------------------------------------------
 # backup volume configuration
 #---------------------------------------------------------------------------
 backups:
   #
-  # -- You may override globals inside each ${name} key (which is <friendlyname>) below!
+  # -- You may override globals inside each key (<volname>) context below!
   #
 
   # -- Internal 2.5" Samsung evo860 SSD
@@ -57,12 +69,24 @@ backups:
     rsnapshotconf: rsnapshot-pam.conf
     luks_mapname: 'pam'
 
-  # -- External 2.5" Sabrent enclosure with Samsung evo850
+  # -- External USB-connected, 2.5" Sabrent enclosure with Samsung evo850
+  #    This one has a manual on/off switch and is auto-discovered by systemd/udev when turned on.
   'doggo':
     uuid: '97912a84-f5d0-43d6-9b6a-626f43c77643'
     mountpoint: /media/doggo
     rsnapshotconf: 'rsnapshot-doggo.conf'
     luks_mapname: 'doggo'
+
+  # -- External, USB-connected, NVMe enclosure with Samsung evo970.
+  #    Normally turned off & without a manual switch, (needs turn-on by software).
+  'seinikay':
+    uuid: '9a9ba841-fd05-4e63-b6a-926f43c446683'
+    mountpoint: /media/seinikay
+    rsnapshotconf: 'rsnapshot-seinikay.conf'
+    luks_mapname: 'seinikay'
+    # To bring this device online, we need to bind the 3-1 port via USB + wait ~5 secs for it to initialize
+    on_command:  ['bash', '-c', 'if echo "3-1" >/sys/bus/usb/drivers/usb/bind; then sleep 5; exit 0; fi']
+    off_command: ['bash', '-c', 'echo "3-1" >/sys/bus/usb/drivers/usb/unbind']
 
   # -- SanDisk Memory Stick
   'sandisk64':
