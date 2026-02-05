@@ -153,7 +153,6 @@ def find_config_file():
     for path in CONFIG_PATHS:
         config_path = path / CONFIG_FILE_NAME
         if config_path.is_file():
-            log_operation(f"Loaded configuration from: {config_path}", 'INFO')
             return config_path
     return None
 
@@ -164,8 +163,10 @@ def load_config(config_path):
     try:
         with open(config_path, 'r', encoding='latin1') as f:
             config = yaml.safe_load(f)
+            log_operation(f"Loaded configuration from: {config_path}", 'INFO')
         if 'backups' not in config:
             raise ValueError(f"{config_path}: 'backups' key missing.")
+
         return config
     except Exception as e:
         abort(f"{config_path}: configuration error: {e}")
@@ -351,6 +352,18 @@ def is_mounted(mountpoint):
     except Exception:
         return False
 
+def volname_to_dm_mountpoint(volname):
+    """Return the mount-point of /dev/mapper/{volname} iff exists"""
+    devmapname = f"/dev/mapper/{volname}"
+    if os.path.exists(devmapname):
+        with open('/proc/mounts', 'r', encoding='latin1') as f:
+            for line in f.readlines():
+                # /dev/mapper/evo850 /media/<user>/evo850 ext4 rw,nosuid,nodev,relatime,errors=remount-ro 0 0
+                f0, f1, _ = line.split(maxsplit=2)
+                if f0 == devmapname:
+                    return f1
+    return ''
+
 
 def is_open(volname):
     """Check if a volume is open (luks encryption unlocked)."""
@@ -497,7 +510,19 @@ def run_open_operation(context, command_line):
 
 def run_umount_operation(context, command_line):
     """fail-safe/idempotent un-mount op"""
+    volname = context['volname']
+    dm_point = f"/dev/mapper/{volname}"
     mountpoint = context['mountpoint']
+    dm_mountpoint = volname_to_dm_mountpoint(volname)
+
+    if mountpoint and dm_mountpoint and mountpoint != dm_mountpoint:
+        # Contradicting mounts (configured vs. device-manager apping)
+        log_operation(f"Mount conflict: {dm_point} -> {dm_mountpoint} (!= config: {mountpoint})", 'INFO')
+        try:
+            run_command(['umount', dm_mountpoint], check=True)
+        except subprocess.CalledProcessError:
+            abort("Aborting due to umount failure.", command_line)
+
     if not is_mounted(mountpoint):
         # fail-safe: when not mounted, this is a safe no-op.
         return
@@ -538,7 +563,7 @@ def do_force_open(context, command_line):
         log_operation(f"Closing conflicting map '{active_map_name}'.", 'WARNING')
         subprocess.run(['cryptsetup', 'close', active_map_name], check=True)
         #--do we want this too?--#
-        run_command(['dmsetup', 'remove', active], check=False)
+        run_command(['dmsetup', 'remove', active_map_name], check=False)
 
     if not run_open_operation(context, command_line):
         abort("Force-open failed.", command_line)
@@ -546,17 +571,17 @@ def do_force_open(context, command_line):
 
 def run_close_operation(context, command_line):
     """Execute 'close' command."""
+    volname = context['volname']
     luks_map_name = context['luks_mapname']
     # Not a reliable check, commented out
     # if not check_luks_status(luks_map_name):
     #    return
-    volname = context['volname']
     if not is_open(volname):
         # Already closed...
         turn_off(context)       # make sure the device is turned-off (if supported)
         return
 
-    # Device is open and needs closing. First, make sure it is unmounted
+    # Device needs closing. First, make sure it is unmounted
     run_umount_operation(context, command_line)
 
     close_cmd = substitute_template(context.get('close_command'), context)
